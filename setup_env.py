@@ -19,6 +19,7 @@ import zipfile
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent
+NO_WINDOW_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 ADB_CANDIDATES = [
     os.environ.get("ADB_PATH", ""),
     r"C:\Program Files\Netease\MuMuPlayer-12.0\shell\adb.exe",
@@ -77,7 +78,7 @@ def install_frida():
     ]
     for c in cmds:
         print("   " + " ".join(c[2:]))
-        r = subprocess.run(c, capture_output=True, text=True, errors="ignore")
+        r = subprocess.run(c, capture_output=True, text=True, errors="ignore", creationflags=NO_WINDOW_FLAGS)
         if r.returncode == 0:
             break
         print("   " + (r.stderr or r.stdout).strip().splitlines()[-1][:160])
@@ -128,8 +129,8 @@ def connect_emulator(adb):
     step("Kết nối giả lập")
     ports = ["16384", "7555", "16416", "21503", "62001"]
     for p in ports:
-        subprocess.run([adb, "connect", f"127.0.0.1:{p}"], capture_output=True, text=True, errors="ignore")
-    out = subprocess.run([adb, "devices"], capture_output=True, text=True, errors="ignore").stdout
+        subprocess.run([adb, "connect", f"127.0.0.1:{p}"], capture_output=True, text=True, errors="ignore", creationflags=NO_WINDOW_FLAGS)
+    out = subprocess.run([adb, "devices"], capture_output=True, text=True, errors="ignore", creationflags=NO_WINDOW_FLAGS).stdout
     devices = [l.split("\t")[0] for l in out.splitlines()[1:] if "\tdevice" in l]
     if not devices:
         warn("Chưa kết nối được thiết bị nào. Hãy chắc chắn MuMu đã khởi động và đã bật gỡ lỗi ADB trong Cài đặt")
@@ -145,7 +146,8 @@ def run_check(adb, serial):
     env["ADB_PATH"] = adb
     env["PYTHONIOENCODING"] = "utf-8"
     r = subprocess.run([sys.executable, "ultra0.py", "--check"], cwd=str(BASE),
-                       env=env, capture_output=True, encoding="utf-8", errors="ignore")
+                       env=env, capture_output=True, encoding="utf-8", errors="ignore",
+                       creationflags=NO_WINDOW_FLAGS)
     print(r.stdout.strip() or r.stderr.strip())
     return r.returncode == 0
 

@@ -53,11 +53,12 @@ def wait_human(msg: str, timeout: int = 600) -> bool:
 PKG = "com.google.android.apps.subscriptions.red"   # Google One
 VENDING = "com.android.vending"                     # Cửa hàng Play
 GMS = "com.google.android.gms"
-PRODUCT = "g1.play.20tb"                            # Ultra 5x / 20TB
-OFFER = "eft-12month"                               # Miễn phí năm đầu
 MODULE_REMOTE = "/data/local/tmp/module_521.apk"
+MODULE_SHA256 = "38a1cd132f10b31c3f4ec85d341764c702148175e2db7e480a288468b39b7b74"
 FRIDA_REMOTE = "/data/local/tmp/frida-server"
 REPORT_DIR = Path("ultra0-report")
+SKIP_ACCOUNT_CHECK = False
+SUBSCRIBED_KEYWORDS = ("Ultra", "Google AI Pro", "AI Pro", "20 TB", "30 TB", "20TB", "30TB")
 
 ADB_CANDIDATES = [
     os.environ.get("ADB_PATH", ""),
@@ -74,6 +75,9 @@ ADB_CANDIDATES = [
 ]
 
 
+NO_WINDOW_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+
 # ---------- Công cụ cơ bản ----------
 def find_adb() -> str:
     for c in ADB_CANDIDATES:
@@ -81,7 +85,7 @@ def find_adb() -> str:
             continue
         if c in ("adb", "adb.exe") or Path(c).exists():
             try:
-                subprocess.run([c, "version"], capture_output=True, timeout=5)
+                subprocess.run([c, "version"], capture_output=True, timeout=5, creationflags=NO_WINDOW_FLAGS)
                 return c
             except Exception:
                 continue
@@ -94,7 +98,7 @@ SERIAL = None
 
 def sh(*args, timeout=60, check=False, binary=False):
     cmd = [ADB] + (["-s", SERIAL] if SERIAL else []) + list(args)
-    p = subprocess.run(cmd, capture_output=True, timeout=timeout)
+    p = subprocess.run(cmd, capture_output=True, timeout=timeout, creationflags=NO_WINDOW_FLAGS)
     if check and p.returncode != 0:
         raise RuntimeError(p.stderr.decode("utf-8", "ignore")[:300])
     return p.stdout if binary else p.stdout.decode("utf-8", "ignore").strip()
@@ -284,14 +288,20 @@ def ensure_vending():
 
 
 def ensure_module_apk():
-    if sh("shell", f"ls {MODULE_REMOTE} 2>/dev/null"):
-        ok("Module thanh toán đã sẵn sàng")
+    """Giải mã, kiểm tra toàn vẹn SHA-256 và đẩy module thanh toán lên thiết bị nếu cần."""
+    remote_hash = sh("shell", f"sha256sum {MODULE_REMOTE} 2>/dev/null || true").split()
+    if remote_hash and remote_hash[0].lower() == MODULE_SHA256:
+        ok("Module thanh toán đã sẵn sàng (SHA-256 khớp)")
         return
+    raw = base64.b64decode(MODULE_B64)
+    actual_sha = hashlib.sha256(raw).hexdigest()
+    if actual_sha != MODULE_SHA256:
+        sys.exit(f"❌ Kiểm tra toàn vẹn module_521.apk thất bại (SHA-256={actual_sha})")
     note("Đang đẩy module thanh toán (chỉ 1 lần)…")
     tmp = Path(tempfile.gettempdir()) / "module_521.apk"
-    tmp.write_bytes(base64.b64decode(MODULE_B64))
+    tmp.write_bytes(raw)
     sh("push", str(tmp), MODULE_REMOTE, timeout=120)
-    ok("Đã đẩy module thanh toán")
+    ok("Đã đẩy module thanh toán (SHA-256 đã xác thực)")
 
 
 def ensure_network():
@@ -334,12 +344,14 @@ def tap(x, y):
     sh("shell", f"input tap {x} {y}")
 
 
-def tap_text(*needles, exact=False) -> bool:
+def tap_text(*needles, exact=False, ignore_case=False) -> bool:
     for n in nodes(ui_xml()):
         label = n["text"] or n["desc"]
         if not label:
             continue
-        hit = (label == needles[0]) if exact and needles else any(k in label for k in needles)
+        hay = label.lower() if ignore_case else label
+        keys = [k.lower() for k in needles] if ignore_case else needles
+        hit = (hay == keys[0]) if exact and keys else any(k in hay for k in keys)
         if hit and (n["x"] or n["y"]):
             tap(n["x"], n["y"])
             return True
@@ -460,6 +472,71 @@ def add_account(email, password, totp_secret="") -> bool:
     return False
 
 
+def remove_account(email: str = "") -> bool:
+    """Đăng xuất / xóa tài khoản Google khỏi thiết bị thông qua Cài đặt tài khoản."""
+    target = email.strip()
+    if not target:
+        target = current_play_account()
+    step(f"Đang xóa tài khoản khỏi thiết bị: {target or '(tài khoản đầu tiên)'}")
+    before_list = accounts_on_device()
+    if not before_list:
+        ok("Thiết bị hiện không có tài khoản Google nào")
+        return True
+
+    sh("shell", "am start -a android.settings.SYNC_SETTINGS")
+    time.sleep(3)
+
+    # Nếu chưa thấy email trên màn hình, thử vào mục Google
+    xml = ui_xml()
+    if target:
+        if not tap_text(target, exact=False, ignore_case=True):
+            if tap_text("Google", exact=True, ignore_case=True) or tap_text("Google", ignore_case=True):
+                time.sleep(2)
+                tap_text(target, exact=False, ignore_case=True)
+    else:
+        tapped = False
+        for n in nodes(xml):
+            label = n["text"] or n["desc"]
+            if "@" in label and (n["x"] or n["y"]):
+                tap(n["x"], n["y"])
+                tapped = True
+                break
+        if not tapped and (tap_text("Google", exact=True, ignore_case=True) or tap_text("Google", ignore_case=True)):
+            time.sleep(2)
+            for n in nodes(ui_xml()):
+                label = n["text"] or n["desc"]
+                if "@" in label and (n["x"] or n["y"]):
+                    tap(n["x"], n["y"])
+                    break
+
+    time.sleep(2)
+    remove_labels = ("xóa tài khoản", "xoá tài khoản", "remove account", "移除账号", "删除账号")
+    found_btn = tap_text(*remove_labels, ignore_case=True)
+    if not found_btn:
+        time.sleep(2)
+        found_btn = tap_text(*remove_labels, ignore_case=True)
+    if not found_btn:
+        warn("Không tìm thấy nút 'Remove account' / 'Xóa tài khoản', hãy xóa thủ công trên thiết bị rồi bấm Enter")
+        wait_human("Vui lòng chọn tài khoản và bấm Remove account / Xóa tài khoản trên thiết bị", 180)
+    else:
+        time.sleep(2)
+        # Xác nhận lần 2 trong hộp thoại
+        tap_text(*remove_labels, "xác nhận", "ok", "confirm", "确定", ignore_case=True)
+        time.sleep(3)
+
+    after_list = accounts_on_device()
+    if target:
+        still_there = any(target.lower() in line.lower() for line in after_list)
+        if not still_there:
+            ok(f"Đã xóa tài khoản {target} khỏi thiết bị")
+            return True
+    elif len(after_list) < len(before_list):
+        ok("Đã xóa tài khoản khỏi thiết bị")
+        return True
+    warn("Chưa xác nhận được tài khoản đã bị xóa (vui lòng kiểm tra lại trên thiết bị)")
+    return False
+
+
 def add_card(card: dict) -> bool:
     """Thêm một thẻ trong Google Pay (số thẻ/ngày hết hạn/CVC/chủ thẻ/mã bưu chính)."""
     if not card:
@@ -543,9 +620,60 @@ def launch_app() -> int:
     return int(pid) if pid.strip().isdigit() else 0
 
 
-def build_js(plan: str = "auto", list_only: bool = False, stack: bool = False, old_token: str = "", stack_mode=None) -> str:
-    """Chọn sản phẩm cần tra theo plan: 5x=20TB, 20x=30TB (ID kèm dùng thử bị ẩn)."""
-    js = FRIDA_JS
+def load_frida_js() -> str:
+    """Đọc mã Frida agent từ frida_agent.js cùng thư mục."""
+    js_path = Path(__file__).with_name("frida_agent.js")
+    if not js_path.exists():
+        raise FileNotFoundError(f"Không tìm thấy {js_path}")
+    return js_path.read_text(encoding="utf-8")
+
+
+EFT_PLANS = {
+    "eft15": ("g1.2tb.ai.15months_eft", "eft-15months"),
+    "eft12": ("g1.2tb.ai.12months_eft", "eft-12months"),
+    "eft6": ("g1.2tb.ai.6months_eft", "eft-6months"),
+    "eft4": ("g1.2tb.ai.4months_eft", "eft-4months"),
+    "eft3": ("g1.2tb.ai.3months_eft", "eft-3months"),
+    "eft2": ("g1.2tb.ai.2months_eft", "eft-2months"),
+    "eft1": ("g1.2tb.ai.1month_eft", "eft-1month"),
+}
+
+# 1. Nhóm giảm 90% (basePlan: p1m, offerId: introprice)
+INTRO90_OFFER_TOKEN = (
+    "AYrTWi6m390S5L8/v/68ytX7FGefqs730Fb8RMphQ9nHXjRga2FTIto3+rL6WvPp4kNgYB2aQTdKr8S4mI6ehGhrLWAW4tti"
+)
+INTRO90_PLANS = {
+    "u30_3m_90p": ("g1.ai.ultra.3months_ip_90p.acq", "introprice", INTRO90_OFFER_TOKEN),
+    "u30_1m_90p": ("g1.ai.ultra.1month_ip_90p.acq", "introprice", INTRO90_OFFER_TOKEN),
+    "u20_3m_90p": ("g1.20tb.3months_ip_90p", "introprice", INTRO90_OFFER_TOKEN),
+    "u20_3m_90p_acq": ("g1.20tb.3months_ip_90p.acq", "introprice", INTRO90_OFFER_TOKEN),
+}
+
+U20_SKUS = [
+    "g1.20tb.3months_ip_90p",
+    "g1.20tb.3months_ip_90p.acq",
+    "g1.play.20tb",
+    "g1.20tb",
+]
+U30_SKUS = [
+    "g1.ai.ultra.3months_ip_90p.acq",
+    "g1.ai.ultra.1month_ip_90p.acq",
+    "g1.play.ai.pro",
+    "g1.ai.pro",
+]
+DISCOUNT_SCAN_PLANS = {
+    "u20_discount": U20_SKUS,
+    "u30_discount": U30_SKUS,
+}
+
+
+def is_discount_plan(plan: str, allow_discount: bool = False) -> bool:
+    return bool(allow_discount or plan in INTRO90_PLANS or plan in DISCOUNT_SCAN_PLANS)
+
+
+def build_js(plan: str = "auto", list_only: bool = False, stack: bool = False, old_token: str = "", stack_mode=None, allow_discount: bool = False, offer_token: str = "") -> str:
+    """Chọn sản phẩm cần tra theo plan: 5x=20TB, 20x=30TB, pro*/eft*=AI Pro 5TB, u*_90p*/u*_discount=Ultra giảm giá."""
+    js = load_frida_js()
     if list_only:
         js = js.replace('var PREFER="";', 'var PREFER=""; var LIST_ONLY=true;', 1)
     if stack:
@@ -554,12 +682,31 @@ def build_js(plan: str = "auto", list_only: bool = False, stack: bool = False, o
         js = js.replace('var PREFER="";', 'var PREFER=""; var OLD_TOKEN="%s";' % old_token, 1)
     if stack_mode is not None:
         js = js.replace('var PREFER="";', 'var PREFER=""; var STACK_MODE=%d;' % stack_mode, 1)
+    if is_discount_plan(plan, allow_discount):
+        js = js.replace('var PREFER="";', 'var PREFER=""; var ALLOW_DISCOUNT=true;', 1)
+    if offer_token:
+        js = js.replace('var PREFER="";', 'var PREFER=""; var OFFER_TOKEN=%s;' % json.dumps(offer_token), 1)
     if plan == "20x":
         js = js.replace('var PRODUCTS=["g1.play.20tb","g1.play.ai.pro","g1.30tb"];',
-                        'var PRODUCTS=["g1.play.ai.pro","g1.ai.pro","g1.30tb"];')
+                        'var PRODUCTS=["g1.play.ai.pro","g1.ai.pro","g1.30tb","g1.ai.ultra"];')
     elif plan == "5x":
         js = js.replace('var PRODUCTS=["g1.play.20tb","g1.play.ai.pro","g1.30tb"];',
-                        'var PRODUCTS=["g1.play.20tb"];')
+                        'var PRODUCTS=["g1.play.20tb","g1.20tb"];')
+    elif plan in DISCOUNT_SCAN_PLANS:
+        skus = DISCOUNT_SCAN_PLANS[plan]
+        js = js.replace('var PRODUCTS=["g1.play.20tb","g1.play.ai.pro","g1.30tb"];',
+                        'var PRODUCTS=' + json.dumps(skus) + ';')
+    elif plan in EFT_PLANS:
+        sku, prefer = EFT_PLANS[plan]
+        js = js.replace('var PRODUCTS=["g1.play.20tb","g1.play.ai.pro","g1.30tb"];',
+                        f'var PRODUCTS=["{sku}"];')
+        js = js.replace('var PREFER="";', f'var PREFER="{prefer}";', 1)
+    elif plan in INTRO90_PLANS:
+        sku, prefer, default_offer_token = INTRO90_PLANS[plan]
+        js = js.replace('var PRODUCTS=["g1.play.20tb","g1.play.ai.pro","g1.30tb"];',
+                        f'var PRODUCTS=["{sku}"];')
+        tok_part = f' var OFFER_TOKEN={json.dumps(default_offer_token)};' if not offer_token else ""
+        js = js.replace('var PREFER="";', f'var PREFER="{prefer}";{tok_part}', 1)
     elif plan.startswith("pro"):
         # Google AI Pro 5TB (g1.2tb.ai.subs_variant）：12months-eft / 6months-eft / 6months-eft-2 / 6months-eft-ss-2026
         prefer = {"pro12": "12months-eft", "pro6": "6months-eft",
@@ -570,12 +717,17 @@ def build_js(plan: str = "auto", list_only: bool = False, stack: bool = False, o
     return js
 
 
-def run_trial(pid: int, wait=90, plan="auto", list_only=False, stack=False, old_token="", stack_mode=None) -> dict:
+def run_trial(pid: int, wait=90, plan="auto", list_only=False, stack=False, old_token="", stack_mode=None, allow_discount: bool = False, offer_token: str = "") -> dict:
     import frida
     step("Đang inject module thanh toán, tra dùng thử miễn phí")
     dev = frida.get_usb_device(timeout=10)
     sess = dev.attach(pid)
     res = {"offers": [], "launched": None, "purchase": None, "errors": []}
+    done = threading.Event()
+    terminal_events = {
+        "launched", "list_only", "no_trial", "no_activity",
+        "boot_fail", "boot_err", "query_err", "launch_err", "launch_outer_err",
+    }
 
     def on_msg(m, _):
         p = m.get("payload") or {}
@@ -591,11 +743,21 @@ def run_trial(pid: int, wait=90, plan="auto", list_only=False, stack=False, old_
             res["purchase"] = p
         elif ev and ("err" in ev or ev.startswith("no_")):
             res["errors"].append(p)
+        if ev in terminal_events:
+            done.set()
 
-    sc = sess.create_script(build_js(plan, list_only, stack, old_token, stack_mode))
+    sc = sess.create_script(build_js(plan, list_only, stack, old_token, stack_mode, allow_discount, offer_token))
     sc.on("message", on_msg)
-    sc.load()
-    time.sleep(wait)
+    try:
+        sc.load()
+        done.wait(timeout=wait)
+        if done.is_set():
+            time.sleep(0.5)
+    finally:
+        try:
+            sess.detach()
+        except Exception:
+            pass
     return res
 
 
@@ -616,43 +778,94 @@ def handle_verify(password="") -> bool:
     return changed
 
 
-def confirm_zero(wait=40, password="") -> dict:
-    step("Kiểm tra số tiền ở trang thanh toán (chỉ xác nhận khi là 0 đồng)")
+def _is_ineligible(text: str) -> bool:
+    low = text.lower()
+    return (
+        "không đủ điều kiện dùng thử miễn phí" in low
+        or "不符合免费试用条件" in text
+        or "not eligible" in low
+    )
+
+
+def _is_subscribed_text(text: str) -> bool:
+    return any(kw in text for kw in SUBSCRIBED_KEYWORDS)
+
+
+def _tap_subscribe() -> bool:
+    for lbl in ("Đăng ký", "订阅", "Subscribe"):
+        if tap_text(lbl, exact=True):
+            return True
+    return tap_text("Đăng ký", "订阅", "Subscribe")
+
+
+def _wait_after_subscribe(password="", timeout=18):
+    """Đợi Play Store hoàn tất xử lý giao dịch trước khi chuyển sang trang Subscriptions."""
+    time.sleep(3)
+    handle_verify(password)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        blob = " ".join(n["text"] for n in nodes(ui_xml()) if n["text"])
+        low = blob.lower()
+        if any(k in low for k in ("subscribed", "đã đăng ký", "payment successful", "thanh toán thành công")):
+            tap_text("Đã hiểu", "Got it", "OK", "Đóng", "Close", "Không, cảm ơn", "No thanks")
+            time.sleep(1.5)
+            return
+        if any(k in low for k in ("declined", "từ chối", "something went wrong", "đã xảy ra lỗi", "error", "lỗi")):
+            warn(f"Play báo lỗi khi thanh toán: {blob[:160]}")
+            return
+        if not any(k in blob for k in ("Đăng ký", "订阅", "Subscribe", "Subscribing", "Đang đăng ký", "Processing", "Đang xử lý")):
+            return
+        time.sleep(2)
+
+
+def confirm_zero(wait=40, password="", allow_discount=False) -> dict:
+    if allow_discount:
+        step("Kiểm tra số tiền ở trang thanh toán (cho phép gói giảm giá / 0 đồng)")
+    else:
+        step("Kiểm tra số tiền ở trang thanh toán (chỉ xác nhận khi là 0 đồng)")
     out = {"price": None, "confirmed": False, "ineligible": False, "text": ""}
+    price_re = re.compile(r"(US\$|HK\$|NT\$|JP¥|CN¥|VNĐ|\$|€|£|¥|₫)\s?([\d.,]+)")
+    zero_re = re.compile(r"(US\$|HK\$|NT\$|JP¥|CN¥|\$|€|£|¥)\s?0(\.00)?\b")
+    trial_re = re.compile(r"(Dùng thử miễn phí|免费试用|Free trial)\s*\d+\s*(tháng|năm|ngày|个月|年|mo|month|day)", re.I)
+
     for _ in range(wait // 2):
         xml = ui_xml()
         text = " ".join(n["text"] for n in nodes(xml) if n["text"])
-        if "không đủ điều kiện dùng thử miễn phí" in text.lower() or "不符合免费试用条件" in text or "not eligible" in text.lower():
-            warn("Play báo: tài khoản này không đủ điều kiện dùng thử miễn phí")
-            if tap_text("Đã hiểu", "知道了", "OK", "Got it"):
+        if _is_ineligible(text):
+            warn("Play báo: tài khoản này không đủ điều kiện ưu đãi / dùng thử")
+            if tap_text("Đã hiểu", "知道了", "OK", "Got it", "Đóng", "Hủy", "关闭", "取消", "Close"):
                 time.sleep(2)
             out["ineligible"] = True
             return out
-        if ("Đăng ký" in text or "订阅" in text or "Subscribe" in text) and ("Ultra" in text or "AI" in text):
+        if ("Đăng ký" in text or "订阅" in text or "Subscribe" in text) and any(
+            kw in text for kw in ("Ultra", "AI", "20 TB", "30 TB", "20TB", "30TB", "Google One")
+        ):
             out["text"] = text[:300]
-            m = re.search(r"(US\$|HK\$|NT\$|\$|€|£)\s?([\d.,]+)", text)
+            m = price_re.search(text)
             if m:
                 out["price"] = m.group(0)
                 try:
                     if float(m.group(2).replace(",", "")) == 0:
-                        tap_text("Đăng ký", "订阅", "Subscribe")
+                        _tap_subscribe()
                         out["confirmed"] = True
                         ok("Đã xác nhận đăng ký 0 đồng")
+                        _wait_after_subscribe(password)
                         return out
                 except Exception:
                     pass
+                if allow_discount:
+                    _tap_subscribe()
+                    out["confirmed"] = True
+                    ok(f"Đã xác nhận đăng ký gói giảm giá ({m.group(0)})")
+                    _wait_after_subscribe(password)
+                    return out
                 warn(f"Số tiền hiện tại là {m.group(0)}, không phải 0 đồng, không bấm xác nhận")
                 return out
-            if ("không đủ điều kiện dùng thử miễn phí" in text.lower()) or ("不符合免费试用条件" in text) or ("not eligible" in text.lower()):
-                out["ineligible"] = True
-                warn("Play: tài khoản này không đủ điều kiện dùng thử miễn phí, không bấm xác nhận")
-                tap_text("Đóng", "Hủy", "关闭", "取消", "Close"); return out
-            if (re.search(r"(US\$|HK\$|NT\$|\$)\s?0(\.00)?\b", text)
-                    or "US$0/tháng" in text or "US$0/月" in text or "US$0.00" in text
-                    or re.search(r"Dùng thử miễn phí\s*\d+\s*(tháng|năm|mo|month)", text) or re.search(r"免费试用\s*\d+\s*(个月|年|mo|month)", text)):
-                tap_text("Đăng ký", "订阅", "Subscribe")
+            if zero_re.search(text) or trial_re.search(text):
+                _tap_subscribe()
                 out["confirmed"] = True
                 ok("Đã xác nhận dùng thử miễn phí")
+                _wait_after_subscribe(password)
                 return out
         time.sleep(2)
     warn("Không phát hiện trang thanh toán (có thể tài khoản này đã đăng ký rồi)")
@@ -665,13 +878,13 @@ def verify() -> str:
                 f"-d 'https://play.google.com/store/account/subscriptions'")
     time.sleep(9)
     text = " | ".join(n["text"] for n in nodes(ui_xml()) if n["text"])
-    if "Ultra" in text:
-        ok("Trang đăng ký đã hiển thị Ultra")
+    if _is_subscribed_text(text):
+        ok("Trang đăng ký đã hiển thị gói Google AI (Ultra/Pro)")
     return text[:500]
 
 
 # ---------- Quy trình 1 tài khoản ----------
-def process(email, password="", totp_secret="", add=True, card=None, plan="auto", no_switch=False, list_only=False, stack=False, old_token="", stack_mode=None) -> dict:
+def process(email, password="", totp_secret="", add=True, card=None, plan="auto", no_switch=False, list_only=False, stack=False, old_token="", stack_mode=None, allow_discount=False, offer_token="") -> dict:
     print("\n" + "=" * 56)
     print(f"  Đang xử lý tài khoản:{email}")
     print("=" * 56)
@@ -690,7 +903,7 @@ def process(email, password="", totp_secret="", add=True, card=None, plan="auto"
             add_card(card)
         except Exception as e:
             warn(f"Gắn thẻ thất bại:{e}")
-    if globals().get("SKIP_ACCOUNT_CHECK"):
+    if SKIP_ACCOUNT_CHECK:
         ok("Đã bỏ qua kiểm tra tài khoản Play (--force)")
     elif list_only:
         cur = current_play_account()
@@ -707,7 +920,7 @@ def process(email, password="", totp_secret="", add=True, card=None, plan="auto"
         return rec
     if stack and not old_token:
         note("Đang đọc purchaseToken của gói đăng ký hiện tại…")
-        old_token = read_purchase_token("subs_variant")
+        old_token = read_purchase_token("g1.2tb.ai.")
         if old_token:
             ok(f"Đã đọc được purchaseToken ({old_token[:16]}…), sẽ cộng dồn bằng chế độ nâng cấp gói đăng ký")
         else:
@@ -717,15 +930,16 @@ def process(email, password="", totp_secret="", add=True, card=None, plan="auto"
     if not pid:
         rec["status"] = "app_not_started"
         return rec
-    fr = run_trial(pid, plan=plan, list_only=list_only, stack=stack, old_token=old_token, stack_mode=stack_mode)
+    disc = is_discount_plan(plan, allow_discount)
+    fr = run_trial(pid, plan=plan, list_only=list_only, stack=stack, old_token=old_token, stack_mode=stack_mode, allow_discount=disc, offer_token=offer_token)
     rec.update(fr)
     if list_only:
         rec["status"] = "listed"
         return rec
     if fr["launched"] and fr["launched"].get("code") == 0:
-        rec["sheet"] = confirm_zero(password=password)
+        rec["sheet"] = confirm_zero(password=password, allow_discount=disc)
         rec["subscription_page"] = verify()
-        rec["status"] = "subscribed" if "Ultra" in rec["subscription_page"] else "launched"
+        rec["status"] = "subscribed" if _is_subscribed_text(rec["subscription_page"]) else "launched"
     else:
         rec["status"] = "launch_failed"
     return rec
@@ -778,8 +992,97 @@ def parse_card(parts) -> dict | None:
     }
 
 
+def parse_shared_card(card_str: str = "", card_file: str = "") -> dict | None:
+    """Đọc thông tin thẻ dùng chung từ chuỗi (--card) hoặc từ file (--card-file)."""
+    raw = (card_str or "").strip()
+    if not raw and card_file:
+        p = Path(card_file)
+        if not p.exists():
+            warn(f"Không tìm thấy file thẻ: {card_file}")
+            return None
+        for line in p.read_text(encoding="utf-8").splitlines():
+            s = line.strip()
+            if s and not s.startswith("#"):
+                raw = s
+                break
+    if not raw:
+        return None
+    sep = "----" if "----" in raw else ("|" if "|" in raw else ":")
+    parts = [x.strip() for x in raw.split(sep)]
+    if not parts or not parts[0]:
+        return None
+    while len(parts) < 5:
+        parts.append("")
+    return {
+        "number": re.sub(r"\s+", "", parts[0]),
+        "exp": parts[1] or "",
+        "cvc": parts[2] or "",
+        "holder": parts[3] or "",
+        "zip": parts[4] or "97201",
+    }
+
+
+def open_subs_on_device():
+    """Mở trang Gói đăng ký Play Store trực tiếp trên thiết bị Android."""
+    step("Mở trang Gói đăng ký trên thiết bị")
+    sh(
+        "shell",
+        "am start -a android.intent.action.VIEW -d 'https://play.google.com/store/account/subscriptions'",
+    )
+
+
+def open_payments_settings_on_device(email: str = "", password: str = "", totp_secret: str = ""):
+    """Mở trang cài đặt hồ sơ thanh toán Google trên thiết bị và tự điền đăng nhập nếu được cung cấp."""
+    step("Mở trang cài đặt hồ sơ thanh toán trên thiết bị")
+    sh(
+        "shell",
+        "am start -a android.intent.action.VIEW -d 'https://payments.google.com/payments/home#settings'",
+    )
+    if not (email or password):
+        note("Lưu ý: cần hủy gói đăng ký đang hoạt động trước khi đóng hồ sơ thanh toán.")
+        return
+
+    email_sent = False
+    pass_sent = False
+    totp_sent = False
+    for _ in range(15):
+        time.sleep(2)
+        xml = ui_xml()
+        text = " ".join(n["text"] for n in nodes(xml) if n["text"])
+        low = text.lower()
+        if any(k in low for k in ("payments profile", "hồ sơ thanh toán", "close payments profile", "đóng hồ sơ thanh toán")):
+            ok("Đã vào trang cài đặt hồ sơ thanh toán")
+            break
+        pos = find_edit()
+        if not pos:
+            continue
+        if email and not email_sent and any(k in low for k in ("email", "đăng nhập", "sign in")):
+            tap(*pos); time.sleep(0.5)
+            type_text(email); time.sleep(0.8)
+            tap_text("Tiếp theo", "Next", "下一步")
+            email_sent = True
+            note("Đã điền email đăng nhập")
+            continue
+        if password and not pass_sent and any(k in low for k in ("mật khẩu", "password", "密码")):
+            tap(*pos); time.sleep(0.5)
+            type_text(password); time.sleep(0.8)
+            tap_text("Tiếp theo", "Next", "Đăng nhập", "Sign in", "下一步")
+            pass_sent = True
+            note("Đã điền mật khẩu")
+            continue
+        if totp_secret and not totp_sent and any(k in low for k in ("2-step", "xác minh 2 bước", "mã xác minh", "verification code")):
+            code = totp(totp_secret)
+            tap(*pos); time.sleep(0.5)
+            type_text(code); time.sleep(0.8)
+            tap_text("Tiếp theo", "Next", "下一步")
+            totp_sent = True
+            note("Đã điền mã 2FA")
+            continue
+    note("Lưu ý: cần hủy gói đăng ký đang hoạt động trước khi đóng hồ sơ thanh toán.")
+
+
 def main():
-    global ADB, SERIAL
+    global ADB, SERIAL, SKIP_ACCOUNT_CHECK
     ap = argparse.ArgumentParser(description="Script một chạm mở Google AI Ultra 0 đồng")
     ap.add_argument("accounts", nargs="?", help="File tài khoản (mỗi dòng email----password----recovery----totp)")
     ap.add_argument("--account", help="1 tài khoản: email:password:totp")
@@ -790,24 +1093,67 @@ def main():
                     help="Chế độ thay thế: 1=TIME_PRORATION 2=CHARGE_PRORATED_PRICE 3=WITHOUT_PRORATION 4=DEFERRED 5=CHARGE_FULL_PRICE")
     ap.add_argument("--old-token", default="",
                     help="purchaseToken của gói đăng ký hiện tại (dùng kèm --stack, lấy nó để nâng cấp luôn, bỏ qua queryPurchases)")
+    ap.add_argument("--offer-token", default="",
+                    help="offerToken tùy chỉnh để ép dùng khi mở trang thanh toán (ghi đè offerToken mặc định)")
     ap.add_argument("--stack", action="store_true",
                     help="Cộng dồn bằng nâng cấp gói đăng ký: dùng purchaseToken cũ + CHARGE_FULL_PRICE để mở thanh toán, thời gian dùng thử còn lại sẽ được quy đổi và dời lại")
     ap.add_argument("--serial", default=None)
     ap.add_argument("--no-add", action="store_true", help="Bỏ qua tự thêm tài khoản (tài khoản đã có trên điện thoại)")
     ap.add_argument("--no-switch", action="store_true",
                     help="Không tự chuyển tài khoản, chỉ kiểm tra tài khoản Play hiện tại có phải tài khoản cần dùng không")
-    ap.add_argument("--plan", default="auto", choices=["auto", "5x", "20x", "pro12", "pro6", "pro6b", "pro6c"],
-                    help="auto=tra cả hai gói rồi chọn gói dài nhất; 5x=Ultra 20TB; 20x=Ultra 30TB")
+    ap.add_argument("--plan", default="auto", choices=["auto", "5x", "20x", "pro12", "pro6", "pro6b", "pro6c", *EFT_PLANS.keys(), *INTRO90_PLANS.keys(), *DISCOUNT_SCAN_PLANS.keys()],
+                    help="auto=tra cả hai gói rồi chọn gói dài nhất; 5x=Ultra 20TB; 20x=Ultra 30TB; pro*/eft*=AI Pro; u*_90p*/u*_discount=Ultra 20TB/30TB giảm giá")
+    ap.add_argument("--discount", action="store_true",
+                    help="Chấp nhận gói giảm giá (không cần 0 đồng) khi tra offer và xác nhận trên trang thanh toán")
+    ap.add_argument("--open-payments-settings", action="store_true",
+                    help="Mở trang cài đặt hồ sơ thanh toán (payments.google.com) trên thiết bị sau khi chạy xong")
+    ap.add_argument("--open-payments", action="store_true",
+                    help="Chỉ mở trang cài đặt hồ sơ thanh toán trên thiết bị Android rồi thoát")
+    ap.add_argument("--open-subs", action="store_true",
+                    help="Chỉ mở trang Gói đăng ký Play Store trên thiết bị Android rồi thoát")
+    ap.add_argument("--pay-email", default="", help="Email tự điền khi mở trang hồ sơ thanh toán")
+    ap.add_argument("--pay-pass", default="", help="Mật khẩu tự điền khi mở trang hồ sơ thanh toán")
+    ap.add_argument("--pay-totp", default="", help="Khóa 2FA (TOTP) tự điền khi mở trang hồ sơ thanh toán")
+    ap.add_argument("--add-only", action="store_true",
+                    help="Chỉ đăng nhập / thêm tài khoản vào thiết bị (dùng --pay-email/--pay-pass/--pay-totp hoặc --account) rồi thoát")
+    ap.add_argument("--remove-account", action="store_true",
+                    help="Đăng xuất / xóa tài khoản Google khỏi thiết bị (dùng --pay-email hoặc tự chọn tài khoản hiện tại) rồi thoát")
+    ap.add_argument("--card", default="",
+                    help="Thẻ dùng chung (số_thẻ----MM/YY----CVC----chủ_thẻ----ZIP) khi file tài khoản không kèm thẻ")
+    ap.add_argument("--card-file", default="",
+                    help="File chứa 1 dòng thẻ dùng chung cho tất cả tài khoản")
     a = ap.parse_args()
 
     ADB = find_adb()
-    globals()["SKIP_ACCOUNT_CHECK"] = bool(a.force)
+    SKIP_ACCOUNT_CHECK = bool(a.force)
     if a.check:
         return do_check()
 
     pick_device()
     if a.serial:
         SERIAL = a.serial
+    if a.add_only:
+        email = a.pay_email
+        pw = a.pay_pass
+        sec = a.pay_totp
+        if not email and a.account:
+            parts = a.account.split(":")
+            email = parts[0]
+            pw = parts[1] if len(parts) > 1 else pw
+            sec = parts[2] if len(parts) > 2 else sec
+        if not email or not pw:
+            print("❌ Thiếu email hoặc mật khẩu để thêm tài khoản")
+            return 1
+        return 0 if add_account(email, pw, sec) else 1
+    if a.remove_account:
+        email = a.pay_email or (a.account.split(":")[0] if a.account else "")
+        return 0 if remove_account(email) else 1
+    if a.open_subs:
+        open_subs_on_device()
+        return 0
+    if a.open_payments:
+        open_payments_settings_on_device(a.pay_email, a.pay_pass, a.pay_totp)
+        return 0
     ensure_root()
     ensure_network()
     ensure_frida_server()
@@ -827,16 +1173,20 @@ def main():
         ap.print_help()
         return 1
 
+    shared_card = parse_shared_card(a.card, a.card_file)
+    if shared_card:
+        ok(f"Dùng thẻ chung: ****{shared_card['number'][-4:]}")
+
     print(f"\nTổng cộng {len(rows)} tài khoản, bắt đầu chạy\n")
     results = []
     for i, row in enumerate(rows, 1):
         email, pw, _rec, sec = row[0], row[1], row[2], row[3]
-        card = parse_card(row)
+        card = parse_card(row) or shared_card
         print(f"\n──── Tiến độ {i}/{len(rows)} ────")
         try:
             rec = process(email, pw, sec, add=(not a.no_add and not a.list), card=card, plan=a.plan,
                           no_switch=a.no_switch, list_only=a.list, stack=a.stack, old_token=a.old_token,
-                          stack_mode=a.mode)
+                          stack_mode=a.mode, allow_discount=a.discount, offer_token=a.offer_token)
         except Exception as e:
             rec = {"email": email, "status": "exception", "error": str(e)[:200]}
         results.append(rec)
@@ -850,6 +1200,8 @@ def main():
     for r in results:
         print(f"  {r['email']:<42} {r.get('status')}")
     print(f"\nChi tiết đã lưu vào {REPORT_DIR.resolve()}")
+    if a.open_payments_settings:
+        open_payments_settings_on_device(a.pay_email, a.pay_pass, a.pay_totp)
     return 0
 
 
@@ -857,214 +1209,7 @@ entry = main
 
 
 # ---------- Tài nguyên nhúng (ĐỪNG SỬA) ----------
-FRIDA_JS = r'''// Script inject Ultra0: tra nhiều sản phẩm → tự chọn dùng thử miễn phí dài nhất → mở trang thanh toán ở luồng chính
-var dexLoader=null, ctxRef=null, clientRef=null;
-var PRODUCTS=["g1.play.20tb","g1.play.ai.pro","g1.30tb"];   // 5x / 20x (kèm dùng thử) / 20x (gói khác)
-var PREFER="";        // Để trống = tự chọn dài nhất; có thể truyền "eft-12month" v.v.
-function L(v){ Java.classFactory.loader=v; }
-function S(o){ send(o); }
-
-function periodRank(p){
-  var m={"P1Y":12,"P12M":12,"P6M":6,"P3M":3,"P1M":1};
-  return m[String(p)]||0;
-}
-function getActivity(){
-  L(null);
-  var found=null;
-  try{
-    var at=Java.use("android.app.ActivityThread").currentActivityThread();
-    var m=at.mActivities.value;
-    var it=m.values().iterator();
-    var ACR=Java.use("android.app.ActivityThread$ActivityClientRecord");
-    while(it.hasNext()){
-      var rec=Java.cast(it.next(), ACR);
-      var a=rec.activity.value;
-      if(a && !a.isFinishing()){
-        if(!rec.paused.value){ found=a; break; }
-        if(!found) found=a;
-      }
-    }
-  }catch(e){ S({ev:"at_err", m:String(e).slice(0,120)}); }
-  if(found) return found;
-  try{
-    Java.choose("android.app.Activity", {
-      onMatch:function(a){ try{ if(!found && !a.isFinishing()) found=a; }catch(e){} },
-      onComplete:function(){}
-    });
-  }catch(e){ S({ev:"choose_err", m:String(e).slice(0,80)}); }
-  return found;
-}
-function boot(){
- Java.perform(function(){
-  try{
-   L(null);
-   ctxRef=Java.use("android.app.ActivityThread").currentApplication().getApplicationContext();
-   var DexClassLoader=Java.use("dalvik.system.DexClassLoader");
-   dexLoader=DexClassLoader.$new("/data/local/tmp/module_521.apk",
-      ctxRef.getCodeCacheDir().getAbsolutePath(), null, ctxRef.getClassLoader());
-   L(dexLoader);
-   var BillingClient=Java.use("com.android.billingclient.api.BillingClient");
-   var PUL=Java.use("com.android.billingclient.api.PurchasesUpdatedListener");
-   var Lst=Java.registerClass({name:"rc.A"+Date.now(), implements:[PUL], methods:{
-     onPurchasesUpdated:function(r,p){ S({ev:"purchase_cb", code:r.getResponseCode(), msg:String(r.getDebugMessage()||"")}); }}});
-   var b=BillingClient.newBuilder(ctxRef);
-   b.setListener(Lst.$new());
-   try{ b.enablePendingPurchases(); }catch(e){}
-   clientRef=b.build();
-   var SLL=Java.use("com.android.billingclient.api.BillingClientStateListener");
-   var SL=Java.registerClass({name:"rc.B"+Date.now(), implements:[SLL], methods:{
-     onBillingSetupFinished:function(r){ S({ev:"setup", code:r.getResponseCode()});
-        if(r.getResponseCode()===0) query(); },
-     onBillingServiceDisconnected:function(){ S({ev:"disc"}); }}});
-   clientRef.startConnection(SL.$new());
-   S({ev:"connecting", products:PRODUCTS});
-  }catch(e){ S({ev:"boot_err", m:String(e).slice(0,200)}); }
- });
-}
-function query(){
- try{
-  L(dexLoader);
-  var Prod=Java.use("com.android.billingclient.api.QueryProductDetailsParams$Product");
-  var Params=Java.use("com.android.billingclient.api.QueryProductDetailsParams");
-  var PDL=Java.use("com.android.billingclient.api.ProductDetailsResponseListener");
-  var PL=Java.registerClass({name:"rc.C"+Date.now(), implements:[PDL], methods:{
-    onProductDetailsResponse:function(res,list){
-      S({ev:"pd", code:res.getResponseCode(), n:(list?list.size():0)});
-      if(res.getResponseCode()!==0 || !list || list.size()===0) return;
-      L(dexLoader);
-      var PD=Java.use("com.android.billingclient.api.ProductDetails");
-      var SOD=Java.use("com.android.billingclient.api.ProductDetails$SubscriptionOfferDetails");
-      var PP=Java.use("com.android.billingclient.api.ProductDetails$PricingPhase");
-      var best=null;
-      for(var i=0;i<list.size();i++){
-        var pd=Java.cast(list.get(i), PD);
-        var pid=String(pd.getProductId());
-        var offs=pd.getSubscriptionOfferDetails();
-        if(!offs){ S({ev:"no_offers", product:pid}); continue; }
-        for(var j=0;j<offs.size();j++){
-          var o=Java.cast(offs.get(j), SOD);
-          var oid=String(o.getOfferId());
-          var tok=String(o.getOfferToken());
-          var ph=o.getPricingPhases().getPricingPhaseList();
-          var first=Java.cast(ph.get(0), PP);
-          var micros=String(first.getPriceAmountMicros());
-          var period=String(first.getBillingPeriod());
-          S({ev:"offer", product:pid, id:oid, micros:micros, period:period, token:tok, title:String(pd.getTitle()), name:String(pd.getName())});
-          if(micros!=="0") continue;
-          var rank=periodRank(period);
-          if(!best || rank>best.rank || (PREFER && oid===PREFER)){
-            if(PREFER && oid!==PREFER) continue;
-            best={pd:pd, offer:o, product:pid, id:oid, rank:rank, period:period, token:tok};
-          }
-        }
-      }
-      if(!best){ S({ev:"no_trial"}); return; }
-      S({ev:"chosen", product:best.product, id:best.id, period:best.period});
-      if (typeof LIST_ONLY !== "undefined" && LIST_ONLY) {
-        S({ev:"list_only", product:best.product, id:best.id, period:best.period, token:best.token});
-        return;
-      }
-      if (typeof OLD_TOKEN !== "undefined" && OLD_TOKEN) {
-        S({ev:"stack_start", product:best.product, id:best.id, src:"provided_token"});
-        launch(best.pd, best.offer, OLD_TOKEN);
-      } else if (typeof STACK !== "undefined" && STACK) {
-        S({ev:"stack_start", product:best.product, id:best.id, src:"query"});
-        launchWithStack(best.pd, best.offer);
-      } else {
-        launch(best.pd, best.offer);
-      }
-    }}});
-  var arr=Java.use("java.util.ArrayList").$new();
-  for(var k=0;k<PRODUCTS.length;k++){
-    arr.add(Prod.newBuilder().setProductId(PRODUCTS[k]).setProductType("subs").build());
-  }
-  L(dexLoader);
-  clientRef.queryProductDetailsAsync(Params.newBuilder().setProductList(arr).build(), PL.$new());
-  S({ev:"query_sent"});
- }catch(e){ S({ev:"query_err", m:String(e).slice(0,200)}); }
-}
-function launchWithStack(pd, offer){
- try{
-  L(dexLoader);
-  var QP=Java.use("com.android.billingclient.api.QueryPurchasesParams");
-  var PRL=Java.use("com.android.billingclient.api.PurchasesResponseListener");
-  var cls=Java.registerClass({name:"rc.P"+Date.now(), implements:[PRL], methods:{
-    onQueryPurchasesResponse:function(br, purchases){
-      try{
-        var list=Java.cast(purchases, Java.use("java.util.List"));
-        S({ev:"purchases", n:list.size(), code:String(br.getResponseCode())});
-        if(list.size()===0){ S({ev:"no_purchase"}); launch(pd, offer); return; }
-        var pu=Java.cast(list.get(0), Java.use("com.android.billingclient.api.Purchase"));
-        var tok=String(pu.getPurchaseToken());
-        S({ev:"old_purchase", head:tok.slice(0,16), products:String(pu.getProducts())});
-        launch(pd, offer, tok);
-      }catch(e){ S({ev:"stack_query_err", m:String(e).slice(0,200)}); launch(pd, offer); }
-    }}});
-  var qp=QP.newBuilder().setProductType("subs").build();
-  clientRef.queryPurchasesAsync(qp, cls.$new());
- }catch(e){ S({ev:"stack_outer_err", m:String(e).slice(0,200)}); launch(pd, offer); }
-}
-
-function launch(pd, offer, oldTok){
- try{
-  L(dexLoader);
-  var PDP=Java.use("com.android.billingclient.api.BillingFlowParams$ProductDetailsParams");
-  var BFP=Java.use("com.android.billingclient.api.BillingFlowParams");
-  var pdp=PDP.newBuilder().setProductDetails(pd).setOfferToken(String(offer.getOfferToken())).build();
-  var l=Java.use("java.util.ArrayList").$new(); l.add(pdp);
-  var b=BFP.newBuilder().setProductDetailsParamsList(l);
-  if(oldTok){
-    // Nâng cấp gói đăng ký: purchaseToken cũ + CHARGE_FULL_PRICE(5)
-    // Như vậy Play sẽ quy đổi «thời gian dùng thử còn lại» rồi dời lại, thay vì "đổi sang cùng gói, ngày không đổi"
-    try{
-      var SUP=Java.use("com.android.billingclient.api.BillingFlowParams$SubscriptionUpdateParams");
-      var md = (typeof STACK_MODE !== "undefined" && STACK_MODE) ? STACK_MODE : 5;
-      var sb=SUP.newBuilder();
-      // Phiên bản Billing này dùng setReplaceProrationMode (tên cũ là setReplaceSkusProrationMode)
-      var mode_set=false;
-      try{ sb=sb.setReplaceProrationMode(md); mode_set=true; }
-      catch(e1){
-        try{ sb=sb.setReplaceSkusProrationMode(md); mode_set=true; }
-        catch(e2){ S({ev:"mode_err", m:String(e2).slice(0,120)}); }
-      }
-      S({ev:"mode_applied", mode:md, ok:mode_set});
-      var sup=sb.setOldPurchaseToken(String(oldTok)).build();
-      b=b.setSubscriptionUpdateParams(sup);
-      S({ev:"stack_mode", mode:md, old: String(oldTok).slice(0,16)});
-    }catch(e){ S({ev:"stack_param_err", m:String(e).slice(0,160)}); }
-  }
-  var params=b.build();
-  var act=getActivity();
-  S({ev:"activity", a: act? String(act.getClass().getName()) : "null"});
-  if(!act){ S({ev:"no_activity"}); return; }
-  L(null);
-  var Handler=Java.use("android.os.Handler"); var Looper=Java.use("android.os.Looper");
-  var R=Java.registerClass({name:"rc.R"+Date.now(), implements:[Java.use("java.lang.Runnable")], methods:{
-    run:function(){
-      try{
-        L(dexLoader);
-        var Activity=Java.use("android.app.Activity");
-        var r2=clientRef.launchBillingFlow(Java.cast(act, Activity), params);
-        S({ev:"launched", code:r2.getResponseCode(), msg:String(r2.getDebugMessage()||"")});
-      }catch(e){ S({ev:"launch_err", m:String(e).slice(0,200)}); }
-    }}});
-  Handler.$new(Looper.getMainLooper()).post(R.$new());
- }catch(e){ S({ev:"launch_outer_err", m:String(e).slice(0,200)}); }
-}
-var __tries=0;
-var iv=setInterval(function(){
-  try{
-    L(null);
-    var a=Java.use("android.app.ActivityThread").currentApplication();
-    __tries++;
-    if(a || __tries>10){ clearInterval(iv); S({ev:"boot_start", app:!!a, tries:__tries}); boot(); }
-  }catch(e){
-    __tries++;
-    if(__tries>10){ clearInterval(iv); S({ev:"boot_force", m:String(e).slice(0,120)}); try{ boot(); }catch(e2){ S({ev:"boot_fail", m:String(e2).slice(0,160)}); } }
-  }
-},400);
-
-'''
+# Frida agent đã được tách sang frida_agent.js
 
 MODULE_B64 = (
     "UEsDBBQAAAAIANFzcV3Bb+8WR50BAIj0AwALABwAY2xhc3Nlcy5kZXhVVAkAA4n0+2qJ9PtqdXgLAAEE9QEAAAQAAAAAnJ0HdJXF9vZnTs459NA7IhA6kSIY"
