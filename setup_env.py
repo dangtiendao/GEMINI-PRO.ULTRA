@@ -10,7 +10,6 @@ Cách dùng: bấm đúp Cai_dat_moi_truong.bat, hoặc python setup_env.py
 """
 import os
 import platform
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -19,18 +18,12 @@ import zipfile
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent
+if str(BASE) not in sys.path:
+    sys.path.insert(0, str(BASE))
+
+import ultra0
+
 NO_WINDOW_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-ADB_CANDIDATES = [
-    os.environ.get("ADB_PATH", ""),
-    r"C:\Program Files\Netease\MuMuPlayer-12.0\shell\adb.exe",
-    r"C:\Program Files\Netease\MuMuPlayerGlobal-12.0\shell\adb.exe",
-    r"C:\Program Files (x86)\Netease\MuMuPlayer-12.0\shell\adb.exe",
-    r"D:\Program Files\Netease\MuMu\nx_main\adb.exe",
-    r"D:\Program Files\Netease\MuMu\nx_device\12.0\shell\adb.exe",
-    r"C:\Program Files\Netease\MuMu\nx_main\adb.exe",
-    os.path.expandvars(r"%LOCALAPPDATA%\Android\Sdk\platform-tools\adb.exe"),
-    os.path.expandvars(r"%USERPROFILE%\AppData\Local\Android\Sdk\platform-tools\adb.exe"),
-]
 PLATFORM_TOOLS_URL = "https://dl.google.com/android/repository/platform-tools-latest-windows.zip"
 
 
@@ -109,18 +102,10 @@ def download_platform_tools():
 
 def find_adb():
     step("Tìm adb")
-    for c in ADB_CANDIDATES:
-        if not c:
-            continue
-        if c in ("adb", "adb.exe"):
-            continue
-        if Path(c).exists():
-            ok(f"Dùng {c}")
-            return c
-    w = shutil.which("adb")
-    if w:
-        ok(f"Dùng {w} trong PATH")
-        return w
+    adb = ultra0.find_adb(exit_on_fail=False, base_dir=BASE)
+    if adb:
+        ok(f"Dùng {adb}")
+        return adb
     warn("Không tìm thấy adb, bắt đầu tải tự động")
     return download_platform_tools()
 

@@ -18,7 +18,7 @@ accounts.txt Mỗi dòng một tài khoản:
 Script sẽ tự động: đẩy frida-server, đẩy module BillingClient, tra offer, dùng eft-12month để mở trang thanh toán,
 Chỉ bấm «Đăng ký» khi đã xác nhận số tiền là 0.
 """
-import argparse, base64, hashlib, hmac, json, os, re, select, struct, subprocess, sys, threading, time
+import argparse, base64, hashlib, hmac, json, os, re, select, shutil, struct, subprocess, sys, threading, time
 from pathlib import Path
 import tempfile
 
@@ -60,36 +60,231 @@ REPORT_DIR = Path("ultra0-report")
 SKIP_ACCOUNT_CHECK = False
 SUBSCRIBED_KEYWORDS = ("Ultra", "Google AI Pro", "AI Pro", "20 TB", "30 TB", "20TB", "30TB")
 
-ADB_CANDIDATES = [
-    os.environ.get("ADB_PATH", ""),
-    # Windows / MuMu
-    r"C:\Program Files\Netease\MuMuPlayer-12.0\shell\adb.exe",
-    r"C:\Program Files\Netease\MuMuPlayerGlobal-12.0\shell\adb.exe",
-    r"C:\Program Files\Netease\MuMu\emulator\nemu\vmonitor\bin\adb_server.exe",
-    r"C:\Program Files\Netease\MuMu\nx_main\adb.exe",
-    r"C:\Program Files (x86)\Netease\MuMuPlayer-12.0\shell\adb.exe",
-    "adb.exe", "adb",
-    # macOS / Linux
-    os.path.expanduser("~/Library/Android/sdk/platform-tools/adb"),
-    "/opt/homebrew/bin/adb", "/usr/local/bin/adb", "/usr/bin/adb",
-]
-
-
+BASE_DIR = Path(__file__).resolve().parent
 NO_WINDOW_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+_EMULATOR_REG_KEYWORDS = ("mumu", "netease", "ldplayer", "nox", "bluestacks", "memu")
+
+
+def _windows_fixed_drives() -> list[Path]:
+    """Liệt kê các ổ đĩa cố định hiện có trên Windows (không gán cứng ký tự ổ)."""
+    if sys.platform != "win32":
+        return []
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        mask = kernel32.GetLogicalDrives()
+        drives: list[Path] = []
+        for idx in range(26):
+            if not (mask & (1 << idx)):
+                continue
+            root = f"{chr(65 + idx)}:\\"
+            if kernel32.GetDriveTypeW(root) == 3:  # DRIVE_FIXED
+                drives.append(Path(root))
+        if drives:
+            return drives
+    except Exception:
+        pass
+    return [Path(f"{chr(c)}:\\") for c in range(ord("C"), ord("Z") + 1) if Path(f"{chr(c)}:\\").exists()]
+
+
+def _expand_emulator_adb_paths(install_dir: Path) -> list[Path]:
+    """Trả về các đường dẫn adb.exe có thể có bên trong thư mục cài đặt giả lập."""
+    if not install_dir.exists():
+        return []
+    paths = [
+        install_dir / "nx_main" / "adb.exe",
+        *sorted(install_dir.glob("nx_device/*/shell/adb.exe"), reverse=True),
+        install_dir / "shell" / "adb.exe",
+        install_dir / "adb.exe",
+        install_dir / "platform-tools" / "adb.exe",
+        install_dir / "emulator" / "nemu" / "vmonitor" / "bin" / "adb_server.exe",
+    ]
+    return paths
+
+
+def _extract_reg_dir(raw: str, is_dir: bool = False) -> list[Path]:
+    """Trích xuất thư mục cài đặt từ giá trị chuỗi trong Windows Registry."""
+    s = (raw or "").strip()
+    if not s:
+        return []
+    if s.startswith('"'):
+        end = s.find('"', 1)
+        s = s[1:end] if end != -1 else s.strip('"')
+    elif not is_dir:
+        m = re.match(r"^(.+?\.(?:exe|ico|msi))(?:\s+.*|,\s*-?\d+)?$", s, re.IGNORECASE)
+        if m:
+            s = m.group(1)
+        else:
+            s = re.sub(r",\s*-?\d+$", "", s).strip()
+    if not s:
+        return []
+    p = Path(s)
+    if not p.is_absolute():
+        return []
+    if is_dir or p.is_dir():
+        return [p]
+    if p.suffix.lower() in (".exe", ".ico", ".msi"):
+        return [p.parent, p.parent.parent]
+    return [p]
+
+
+def _windows_registry_adb_candidates() -> list[Path]:
+    """Đọc thư mục cài đặt giả lập từ Windows Registry (không phụ thuộc ổ cài đặt)."""
+    if sys.platform != "win32":
+        return []
+    try:
+        import winreg
+    except ImportError:
+        return []
+
+    uninstall_roots = [
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+    ]
+    dirs: list[Path] = []
+    for hive, subkey in uninstall_roots:
+        try:
+            with winreg.OpenKey(hive, subkey) as root_key:
+                count = winreg.QueryInfoKey(root_key)[0]
+                for i in range(count):
+                    try:
+                        name = winreg.EnumKey(root_key, i)
+                        with winreg.OpenKey(root_key, name) as item_key:
+                            try:
+                                disp, _ = winreg.QueryValueEx(item_key, "DisplayName")
+                            except OSError:
+                                disp = name
+                            low = f"{name} {disp}".lower()
+                            if not any(k in low for k in _EMULATOR_REG_KEYWORDS):
+                                continue
+                            for val_name, is_dir in (("InstallLocation", True), ("DisplayIcon", False), ("UninstallString", False)):
+                                try:
+                                    val, _ = winreg.QueryValueEx(item_key, val_name)
+                                except OSError:
+                                    continue
+                                dirs.extend(_extract_reg_dir(str(val), is_dir=is_dir))
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+
+    candidates: list[Path] = []
+    for d in dirs:
+        candidates.extend(_expand_emulator_adb_paths(d))
+    return candidates
+
+
+def _windows_drive_adb_candidates() -> list[Path]:
+    """Quét nhanh các vị trí phổ biến của MuMu / Android SDK trên mọi ổ đĩa cố định."""
+    candidates: list[Path] = []
+    for drive in _windows_fixed_drives():
+        for netease_parent in (
+            drive / "Program Files" / "Netease",
+            drive / "Program Files (x86)" / "Netease",
+            drive / "Netease",
+        ):
+            if netease_parent.is_dir():
+                for sub in sorted(netease_parent.glob("MuMu*")):
+                    if sub.is_dir():
+                        candidates.extend(_expand_emulator_adb_paths(sub))
+        for sub in sorted(drive.glob("MuMu*")):
+            if sub.is_dir():
+                candidates.extend(_expand_emulator_adb_paths(sub))
+        candidates.append(drive / "Android" / "Sdk" / "platform-tools" / "adb.exe")
+        candidates.append(drive / "platform-tools" / "adb.exe")
+    return candidates
+
+
+def _iter_adb_candidates(base_dir: Path | None = None) -> list[str]:
+    """Tập hợp danh sách ứng viên adb theo thứ tự ưu tiên, không hardcode ổ đĩa."""
+    exe = "adb.exe" if sys.platform == "win32" else "adb"
+    root = base_dir or BASE_DIR
+    raw: list[str] = []
+
+    # 1. Biến môi trường chỉ định trực tiếp
+    env_adb = os.environ.get("ADB_PATH", "").strip().strip('"')
+    if env_adb:
+        raw.append(env_adb)
+
+    # 2. platform-tools đi kèm trong thư mục dự án (ưu tiên dùng bản nội bộ của project)
+    raw.append(str(root / "platform-tools" / exe))
+    raw.append(str(root / exe))
+
+    # 3. Trong PATH hệ thống
+    for name in ("adb", exe):
+        w = shutil.which(name)
+        if w:
+            raw.append(w)
+
+    # 4. Android SDK từ biến môi trường / thư mục người dùng
+    for sdk_var in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
+        sdk_val = os.environ.get(sdk_var, "").strip().strip('"')
+        if sdk_val:
+            raw.append(str(Path(sdk_val) / "platform-tools" / exe))
+
+    if sys.platform == "win32":
+        local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+        if local_app_data:
+            raw.append(str(Path(local_app_data) / "Android" / "Sdk" / "platform-tools" / "adb.exe"))
+        user_profile = os.environ.get("USERPROFILE", "").strip()
+        if user_profile:
+            raw.append(str(Path(user_profile) / "AppData" / "Local" / "Android" / "Sdk" / "platform-tools" / "adb.exe"))
+        # 5. Giả lập cài đặt đọc từ Registry và quét các ổ đĩa cố định hiện có
+        raw.extend(str(p) for p in _windows_registry_adb_candidates())
+        raw.extend(str(p) for p in _windows_drive_adb_candidates())
+    else:
+        raw.extend([
+            os.path.expanduser("~/Library/Android/sdk/platform-tools/adb"),
+            os.path.expanduser("~/Android/Sdk/platform-tools/adb"),
+            "/opt/homebrew/bin/adb",
+            "/usr/local/bin/adb",
+            "/usr/bin/adb",
+        ])
+
+    seen: set[str] = set()
+    unique: list[str] = []
+    for item in raw:
+        if not item:
+            continue
+        norm = os.path.normcase(os.path.normpath(item))
+        if norm in seen:
+            continue
+        seen.add(norm)
+        unique.append(item)
+    return unique
+
+
+def _resolve_valid_adb(candidate: str) -> str | None:
+    """Kiểm tra ứng viên adb có tồn tại và chạy được `adb version` không."""
+    resolved = candidate
+    p = Path(candidate)
+    if p.is_file():
+        resolved = str(p.resolve())
+    else:
+        w = shutil.which(candidate)
+        if not w:
+            return None
+        resolved = str(Path(w).resolve())
+    try:
+        r = subprocess.run([resolved, "version"], capture_output=True, timeout=5, creationflags=NO_WINDOW_FLAGS)
+        if r.returncode == 0:
+            return resolved
+    except Exception:
+        pass
+    return None
 
 
 # ---------- Công cụ cơ bản ----------
-def find_adb() -> str:
-    for c in ADB_CANDIDATES:
-        if not c:
-            continue
-        if c in ("adb", "adb.exe") or Path(c).exists():
-            try:
-                subprocess.run([c, "version"], capture_output=True, timeout=5, creationflags=NO_WINDOW_FLAGS)
-                return c
-            except Exception:
-                continue
-    sys.exit("❌ Không tìm thấy adb, hãy cài Android platform-tools rồi thêm vào PATH")
+def find_adb(exit_on_fail: bool = True, base_dir: Path | None = None) -> str | None:
+    """Tìm đường dẫn adb động theo: ADB_PATH -> local platform-tools -> PATH -> SDK -> Registry/ổ đĩa."""
+    for c in _iter_adb_candidates(base_dir=base_dir):
+        valid = _resolve_valid_adb(c)
+        if valid:
+            return valid
+    if exit_on_fail:
+        sys.exit("❌ Không tìm thấy adb, hãy cài Android platform-tools hoặc chạy Cai_dat_moi_truong.bat")
+    return None
 
 
 ADB = None
