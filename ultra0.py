@@ -643,6 +643,8 @@ INTRO90_OFFER_TOKEN = (
     "AYrTWi6m390S5L8/v/68ytX7FGefqs730Fb8RMphQ9nHXjRga2FTIto3+rL6WvPp4kNgYB2aQTdKr8S4mI6ehGhrLWAW4tti"
 )
 INTRO90_PLANS = {
+    "ultra30_90p": ("g1.ai.ultra.3months_ip_90p.acq", "introprice", INTRO90_OFFER_TOKEN),
+    "ultra20_90p": (["g1.20tb.3months_ip_90p", "g1.20tb.3months_ip_90p.acq"], "introprice", INTRO90_OFFER_TOKEN),
     "u30_3m_90p": ("g1.ai.ultra.3months_ip_90p.acq", "introprice", INTRO90_OFFER_TOKEN),
     "u30_1m_90p": ("g1.ai.ultra.1month_ip_90p.acq", "introprice", INTRO90_OFFER_TOKEN),
     "u20_3m_90p": ("g1.20tb.3months_ip_90p", "introprice", INTRO90_OFFER_TOKEN),
@@ -702,9 +704,10 @@ def build_js(plan: str = "auto", list_only: bool = False, stack: bool = False, o
                         f'var PRODUCTS=["{sku}"];')
         js = js.replace('var PREFER="";', f'var PREFER="{prefer}";', 1)
     elif plan in INTRO90_PLANS:
-        sku, prefer, default_offer_token = INTRO90_PLANS[plan]
+        sku_or_list, prefer, default_offer_token = INTRO90_PLANS[plan]
+        skus = [sku_or_list] if isinstance(sku_or_list, str) else list(sku_or_list)
         js = js.replace('var PRODUCTS=["g1.play.20tb","g1.play.ai.pro","g1.30tb"];',
-                        f'var PRODUCTS=["{sku}"];')
+                        'var PRODUCTS=' + json.dumps(skus) + ';')
         tok_part = f' var OFFER_TOKEN={json.dumps(default_offer_token)};' if not offer_token else ""
         js = js.replace('var PREFER="";', f'var PREFER="{prefer}";{tok_part}', 1)
     elif plan.startswith("pro"):
@@ -781,8 +784,9 @@ def handle_verify(password="") -> bool:
 def _is_ineligible(text: str) -> bool:
     low = text.lower()
     return (
-        "không đủ điều kiện dùng thử miễn phí" in low
+        "không đủ điều kiện" in low
         or "不符合免费试用条件" in text
+        or "不符合优惠条件" in text
         or "not eligible" in low
     )
 

@@ -130,7 +130,7 @@ class UltraApp(tk.Tk):
         self.main_pane.add(self.nb, weight=2)
 
     def _build_quick_panel(self, parent):
-        box = ttk.LabelFrame(parent, text="Thao tác nhanh (Môi trường & Gói Pro 5TB)", padding=8, style="Section.TLabelframe")
+        box = ttk.LabelFrame(parent, text="Thao tác nhanh (Môi trường, Pro 5TB & Ultra)", padding=8, style="Section.TLabelframe")
         box.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
         for c in range(2):
             box.columnconfigure(c, weight=1)
@@ -144,21 +144,23 @@ class UltraApp(tk.Tk):
             ("4. Pro +6 tháng (Bước 3)", lambda: self._run_pro("pro6b", stack=True), 2, 1),
             ("5. Pro Dự phòng (+6 tháng)", lambda: self._run_pro("pro6c", stack=True), 3, 0),
             ("Mở Gói đăng ký (Thiết bị)", self._act_open_subs_device, 3, 1),
-            ("EFT 15 tháng (eft15)", lambda: self._run_pro("eft15", stack=False), 4, 0),
-            ("EFT +3 tháng (eft3)", lambda: self._run_pro("eft3", stack=True), 4, 1),
-            ("Ultra 30TB -90% x3T (acq)", lambda: self._run_pro("u30_3m_90p", stack=False), 5, 0),
-            ("Ultra 30TB -90% x1T (acq)", lambda: self._run_pro("u30_1m_90p", stack=False), 5, 1),
-            ("Ultra 20TB -90% x3T", lambda: self._run_pro("u20_3m_90p", stack=False), 6, 0),
-            ("Ultra 20TB -90% x3T (acq)", lambda: self._run_pro("u20_3m_90p_acq", stack=False), 6, 1),
-            ("Quét 20TB giảm giá", lambda: self._run_pro("u20_discount", stack=False), 7, 0),
-            ("Quét 30TB giảm giá", lambda: self._run_pro("u30_discount", stack=False), 7, 1),
-            ("Tra SKU 20TB / 30TB", self._act_query_ultra_skus, 8, 0),
-            ("Đóng hồ sơ thanh toán (Thiết bị)", self._act_open_payments_device, 9, 0),
+            ("6. Ultra 30TB -90% ($19.99 x 3T)", lambda: self._run_pro("ultra30_90p", stack=False), 4, 0),
+            ("7. Ultra 20TB -90% ($9.99 x 3T)", lambda: self._run_pro("ultra20_90p", stack=False), 4, 1),
+            ("EFT 15 tháng (eft15)", lambda: self._run_pro("eft15", stack=False), 5, 0),
+            ("EFT +3 tháng (eft3)", lambda: self._run_pro("eft3", stack=True), 5, 1),
+            ("Ultra 30TB -90% x3T (acq)", lambda: self._run_pro("u30_3m_90p", stack=False), 6, 0),
+            ("Ultra 30TB -90% x1T (acq)", lambda: self._run_pro("u30_1m_90p", stack=False), 6, 1),
+            ("Ultra 20TB -90% x3T", lambda: self._run_pro("u20_3m_90p", stack=False), 7, 0),
+            ("Ultra 20TB -90% x3T (acq)", lambda: self._run_pro("u20_3m_90p_acq", stack=False), 7, 1),
+            ("Quét 20TB giảm giá", lambda: self._run_pro("u20_discount", stack=False), 8, 0),
+            ("Quét 30TB giảm giá", lambda: self._run_pro("u30_discount", stack=False), 8, 1),
+            ("Tra SKU 20TB / 30TB", self._act_query_ultra_skus, 9, 0),
+            ("Đóng hồ sơ thanh toán (Thiết bị)", self._act_open_payments_device, 10, 0),
         ]
         self.action_buttons: list[ttk.Button] = []
         for label, cmd, r, c in actions:
             btn = ttk.Button(box, text=label, command=cmd)
-            span = 2 if r in (8, 9) else 1
+            span = 2 if r in (9, 10) else 1
             btn.grid(row=r, column=c, columnspan=span, sticky="ew", padx=3, pady=3)
             self.action_buttons.append(btn)
 
@@ -188,6 +190,7 @@ class UltraApp(tk.Tk):
             values=[
                 "pro12", "pro6", "pro6b", "pro6c",
                 "eft15", "eft12", "eft6", "eft4", "eft3", "eft2", "eft1",
+                "ultra30_90p", "ultra20_90p",
                 "u30_3m_90p", "u30_1m_90p",
                 "u20_3m_90p", "u20_3m_90p_acq",
                 "u20_discount", "u30_discount",
@@ -533,7 +536,6 @@ class UltraApp(tk.Tk):
         if self.open_payments_var.get():
             cmd.append("--open-payments-settings")
             self._append_payments_auth_args(cmd)
-        self._append_token_args(cmd)
         self._append_token_args(cmd)
         cmd.extend(["--plan", plan])
         self._start_cmd(cmd, f"Đang chạy {plan}…")
